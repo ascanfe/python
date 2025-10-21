@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+Auto Clip AI Full — Batch BLIP+CLIP + Scene Detection + NVENC
+Ottimizzato con AutoClipOptimizedX3
+"""
+
+import os, sys, threading, cv2, tempfile, subprocess, gc
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox, scrolledtext, Toplevel, Button, Label
+from PIL import Image, ImageTk
+import torch
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
+
+# ----------------------
+# CONFIG
+# ----------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FRAME_SKIP = 30
+THUMB_SIZE = (320, 180)
+CLIP_LOCAL_DIR = "./clip_model_local"
+CLIP_SIMILARITY_THRESHOLD = 0.95
+SCENE_CHANGE_THRESHOLD = 0.35
+BATCH_SIZE = 16
+FFMPEG_CRF = 23
+FFMPEG_PRESET = "fast"
+PLUGIN_DIR = "./plugins"
+
+# ----------------------
+# AI MODELS
+# ----------------------
+class AIModels:
+    def __init__(self):
+        self.blip_model = None
+        self.blip_processor = None
+        self.clip_model = None
+        self.ready = False
+
+    def load_models(self, progress_callback=None):
+        if progress_callback: progress_callback("Caricamento BLIP... 0%")
+        self.blip_model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base"
+        )
+        self.blip_processor = BlipProcessor.from_pretrained(
+            "Salesforce/blip-image-captioning-base", use_fast=True
+        )
+        self.blip_model.to(DEVICE)
+        if progress_callback: progress_callback("BLIP pronto 50%")
+        if progress_callback: progress_callback("Caricamento CLIP locale...")
+        self.clip_model = SentenceTransformer('clip-ViT-B-32', cache_folder=CLIP_LOCAL_DIR, device=str(DEVICE))
+        if progress_callback: progress_callback("CLIP pronto 100%")
+        self.ready = True
+
+# ----------------------
+# HELPERS
+# ----------------------
+def ffmpeg_has_nvenc():
+    try:
+        res = subprocess.run(["ffmpeg","-hide_banner","-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+        out = res.stdout.lower()
+        return ("h264_nvenc" in out) or ("hevc_nvenc" in out)
+    except Exception:
+        return False
+
+def extract_frames(video_path):
+    cap = cv2.VideoCapture(str(video_path))
+    frames=[]
+    idx=0
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        if idx % FRAME_SKIP == 0:
+            frames.append(frame.copy())
+        idx+=1
+    cap.release()
+    return frames
+
+def frame_diff(prev_frame, curr_frame):
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    score = np.mean(diff)/255.0
+    return score
+# ----------------------
+# Plugin wrapper
+# ----------------------
+class SceneRefinerPluginWrapper:
+    def __init__(self, plugin_instance):
+        self.plugin = plugin_instance
+
+    def on_video_start(self, video, frames=None):
+        try:
+            self.plugin.on_video_start(video, frames)
+        except TypeError:
+            self.plugin.on_video_start(video)
+
+    def refine_frame(self, idx, frame, caption, blip_score, clip_score, combined_score, select=True, embedding=None):
+        try:
+            return self.plugin.refine_frame(idx, frame, caption, blip_score, clip_score, combined_score, select, embedding)
+        except TypeError:
+            try:
+                select = self.plugin.refine_frame(idx, frame, caption, blip_score, clip_score, combined_score)
+            except Exception:
+                select = True
+            return select, embedding
+
+# ----------------------
+# Plugin Export NVENC
+# ----------------------
+class AutoClipExportPlugin:
+    def __init__(self, app):
+        self.app = app
+        self.tempdir = tempfile.mkdtemp()
+
+    def on_video_start(self, video, frames=None):
+        pass
+
+    def refine_frame(self, idx, frame, caption, blip_score, clip_score, combined_score, select=True, embedding=None):
+        return select, embedding
+
+    def export_video(self, filename="video_finale"):
+        selected_frames = []
+        for v in self.app.videos:
+            for idx, caption, blip_s, clip_s, combined, sel in self.app.scenes_dict.get(v, []):
+                if sel:
+                    selected_frames.append((v, idx))
+        if not selected_frames:
+            print("[⚠ Plugin] Nessun frame selezionato per esportazione.")
+            return
+
+        # Raggruppa frame consecutivi
+        def group_frames(frames, fps=30):
+            grouped = []
+            current_group = []
+            for v, idx in frames:
+                if not current_group:
+                    current_group = [(v, idx)]
+                else:
+                    last_v, last_idx = current_group[-1]
+                    if v == last_v and idx == last_idx + 1:
+                        current_group.append((v, idx))
+                    else:
+                        grouped.append(current_group)
+                        current_group = [(v, idx)]
+            if current_group:
+                grouped.append(current_group)
+            intervals = []
+            for group in grouped:
+                v = group[0][0]
+                start = max(group[0][1]*FRAME_SKIP/fps, 0)
+                end = (group[-1][1]+1)*FRAME_SKIP/fps
+                intervals.append((v, start, end))
+            return intervals
+
+        intervals = group_frames(selected_frames)
+        if not intervals:
+            print("[⚠ Plugin] Nessun intervallo da esportare.")
+            return
+
+        temp_clips = []
+        use_nvenc = ffmpeg_has_nvenc()
+        codec = "h264_nvenc" if use_nvenc else "libx264"
+
+        for i, (v, start, end) in enumerate(intervals, 1):
+            temp_clip = os.path.join(self.tempdir, f"clip_{i:04d}.mp4")
+            cmd = [
+                "ffmpeg","-y",
+                "-ss", str(start), "-to", str(end),
+                "-i", v,
+                "-vf","fps=30,scale=1280:-2",
+                "-c:v", codec,
+                "-preset", "fast",
+                "-crf", str(FFMPEG_CRF),
+                "-c:a","aac","-b:a","128k",
+                temp_clip
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            temp_clips.append(temp_clip)
+            pct = int((i/len(intervals))*100)
+            self.app.progress["value"] = pct
+            self.app.status_label.config(text=f"Esportazione Plugin: {pct}%")
+            self.app.update_idletasks()
+
+        # Concat finale
+        list_file = os.path.join(self.tempdir, "clips.txt")
+        with open(list_file,"w") as f:
+            for clip in temp_clips:
+                f.write(f"file '{clip}'\n")
+        final_out = os.path.join(os.getcwd(), f"{filename}.mp4")
+        subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",list_file,"-c","copy", final_out])
+        self.app.progress["value"] = 100
+        self.app.status_label.config(text="Esportazione Plugin: 100%")
+        print(f"[✅ Plugin Export completato] {final_out}")
+# ----------------------
+# GUI PRINCIPALE
+# ----------------------
+class AutoClipGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Auto Clip AI Full")
+        self.geometry("1500x950")
+
+        # Modelli AI
+        self.ai_models = AIModels()
+
+        # Dati video
+        self.videos = []
+        self.frames_dict = {}
+        self.scenes_dict = {}
+
+        # Temp, plugin e prompt
+        self.tempdir = tempfile.mkdtemp()
+        self.plugins = []
+        self.prompts = ["paesaggio cinematografico", "scena emozionante"]
+        self.weight_blip = 0.5
+
+        # ----------------------
+        # Widget GUI
+        # ----------------------
+        self.create_widgets()
+        self.load_models_async()
+        self.load_plugins()
+        self.after(1000, self.add_plugin_export_button)
+        self.after(1000, self.update_system_usage)  # start monitoring
+
+    # ----------------------
+    # Widget principali
+    # ----------------------
+    def create_widgets(self):
+        top_frame = tk.Frame(self)
+        top_frame.pack(fill="x", padx=5, pady=5)
+
+        tk.Button(top_frame, text="➕ Aggiungi Video", command=self.add_videos, width=20, height=2).pack(side="left", padx=5)
+        tk.Button(top_frame, text="Analizza Tutti", command=self.run_analysis, width=20, height=2).pack(side="left", padx=5)
+        tk.Button(top_frame, text="Gestione Prompt", command=self.edit_prompts, width=20, height=2).pack(side="left", padx=5)
+
+        self.blip_slider = ttk.Scale(top_frame, from_=0, to=100, orient="horizontal", length=150, command=self.update_weight)
+        self.blip_slider.set(int(self.weight_blip*100))
+        self.blip_slider.pack(side="left", padx=5)
+        tk.Label(top_frame, text="Peso BLIP %").pack(side="left", padx=5)
+
+        # Terminale output
+        self.terminal = scrolledtext.ScrolledText(self, height=14, font=("Courier",10))
+        self.terminal.pack(fill="x", padx=5, pady=5)
+        sys.stdout = self
+        sys.stderr = self
+
+        # Progress bar principale
+        self.progress = ttk.Progressbar(self, orient="horizontal", length=800, mode="determinate")
+        self.progress.pack(padx=5, pady=2)
+        self.status_label = tk.Label(self, text="Caricamento modelli...")
+        self.status_label.pack()
+
+        # Indicatori CPU/RAM e GPU
+        self.cpu_ram_label = tk.Label(self, text="CPU: 0% | RAM: 0%")
+        self.cpu_ram_label.pack(pady=2)
+        self.gpu_label = tk.Label(self, text="GPU VRAM: N/A")
+        self.gpu_label.pack(pady=2)
+
+    # ----------------------
+    # Output terminale
+    # ----------------------
+    def write(self, msg):
+        for line in str(msg).splitlines():
+            if line.strip(): self.terminal.insert(tk.END, line+"\n")
+        self.terminal.see(tk.END)
+    def flush(self): pass
+
+    # ----------------------
+    # Aggiornamento slider peso BLIP
+    # ----------------------
+    def update_weight(self, val):
+        try:
+            self.weight_blip = float(val)/100
+        except: pass
+
+    # ----------------------
+    # Aggiornamento sistema (CPU/RAM/GPU)
+    # ----------------------
+    def update_system_usage(self):
+        import psutil
+        cpu_percent = psutil.cpu_percent(interval=None)
+        ram_percent = psutil.virtual_memory().percent
+        self.cpu_ram_label.config(text=f"CPU: {cpu_percent}% | RAM: {ram_percent}%")
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.memory_allocated(0)
+            gpu_total = torch.cuda.get_device_properties(0).total_memory
+            gpu_percent = int(gpu_mem/gpu_total*100)
+            self.gpu_label.config(text=f"GPU VRAM: {gpu_percent}%")
+        else:
+            self.gpu_label.config(text="GPU VRAM: N/A")
+        self.after(1000, self.update_system_usage)
+
+    # ----------------------
+    # Plugins e export
+    # ----------------------
+    def add_plugin_export_button(self):
+        if self.plugins:
+            export_plugin = self.plugins[0]
+            btn = tk.Button(self, text="Esporta Finale Plugin",
+                            command=lambda: export_plugin.export_video("video_finale"),
+                            width=20, height=2)
+            btn.pack(padx=5, pady=5)
+
+    def load_plugins(self):
+        if not os.path.exists(PLUGIN_DIR): os.makedirs(PLUGIN_DIR)
+        self.plugins.clear()
+        export_plugin = AutoClipExportPlugin(self)
+        self.plugins.append(export_plugin)
+        from plugins.autoclip_optimized_x3 import AutoClipOptimizedX3
+        optimized_plugin = AutoClipOptimizedX3(self)
+        self.plugins.append(optimized_plugin)
+
+    # ----------------------
+    # Video & prompt management
+    # ----------------------
+    def add_videos(self):
+        files = filedialog.askopenfilenames(filetypes=[("Video files","*.mp4 *.mov *.avi")])
+        for f in files:
+            if f not in self.videos: self.videos.append(f)
+
+    def edit_prompts(self):
+        win = Toplevel(self)
+        win.title("Gestione Prompt CLIP")
+        win.geometry("600x400")
+        tk.Label(win, text="Inserisci un prompt per riga:").pack(pady=5)
+        text_area = scrolledtext.ScrolledText(win, width=70, height=20)
+        text_area.pack(padx=10, pady=5, fill="both", expand=True)
+        text_area.insert("1.0","\n".join(self.prompts))
+        def save_and_close():
+            new_text = text_area.get("1.0","end").strip()
+            if new_text:
+                self.prompts = [p.strip() for p in new_text.splitlines() if p.strip()]
+            win.destroy()
+        tk.Button(win, text="Salva", command=save_and_close).pack(pady=5)
+
+    # ----------------------
+    # Load modelli in thread
+    # ----------------------
+    def load_models_async(self):
+        def worker():
+            self.ai_models.load_models(progress_callback=self.model_progress)
+            self.status_label.config(text="Modelli pronti ✅")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def model_progress(self, msg):
+        self.status_label.config(text=msg)
+        self.terminal.insert(tk.END, msg+"\n")
+        self.terminal.see(tk.END)
+        self.update_idletasks()
+
+    # ----------------------
+    # Analisi in thread stabile
+    # ----------------------
+    def run_analysis(self):
+        def worker():
+            total_videos = len(self.videos)
+            for i, v in enumerate(self.videos, 1):
+                self.write(f"[🔶 Caricamento frames] {os.path.basename(v)}")
+                frames = extract_frames(v)
+                self.frames_dict[v] = frames
+                self.scenes_dict[v] = []
+            # Avvio plugin X3 dopo che tutti i frames sono pronti
+            for plugin in self.plugins:
+                if hasattr(plugin,"run"):
+                    plugin.run(self)
+        threading.Thread(target=worker, daemon=True).start()
+
+# ----------------------
+# AVVIO APP
+# ----------------------
+if __name__ == "__main__":
+    app = AutoClipGUI()
+    app.mainloop()
+
+    app.mainloop()
+

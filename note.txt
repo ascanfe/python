@@ -1,0 +1,4 @@
+Mancano i png e gif
+Errore caricamento immagine /home/lxuser/Scaricati/lampadina.png: [Errno 2] No such file or directory: '/home/lxuser/Scaricati/lampadina.png'
+Errore caricamento immagine /home/lxuser/Scaricati/monitor.png: [Errno 2] No such file or directory: '/home/lxuser/Scaricati/monitor.png'
+Errore caricamento GIF animata /home/lxuser/Scaricati/k7.gif: [Errno 2] No such file or directory: '/home/lxuser/Scaricati/k7.gif'
